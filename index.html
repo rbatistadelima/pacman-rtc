@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pac-Man WebRTC Multiplayer</title>
+  <style>
+    * { box-sizing: border-box; user-select: none; }
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background: radial-gradient(circle at top, #10143a, #03030a 60%);
+      color: white;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    body { display: flex; justify-content: center; padding: 18px; }
+    .app {
+      width: min(100%, 980px);
+      display: grid;
+      grid-template-columns: 1fr 310px;
+      gap: 14px;
+      align-items: start;
+    }
+    .panel, canvas {
+      border: 1px solid rgba(255,255,255,.15);
+      box-shadow: 0 22px 70px rgba(0,0,0,.42);
+      background: rgba(0,0,0,.5);
+      border-radius: 18px;
+    }
+    canvas {
+      width: 100%;
+      aspect-ratio: 28 / 31;
+      display: block;
+      image-rendering: pixelated;
+    }
+    .panel { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    h1 { font-size: 18px; margin: 0 0 4px; color: #ffe95c; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button, input, textarea { border: 0; border-radius: 12px; padding: 9px 10px; font: inherit; }
+    button { background: #ffe95c; color: #080812; font-weight: 800; cursor: pointer; }
+    button.alt { background: #7ee7ff; }
+    button.danger { background: #ff7e99; }
+    textarea, input {
+      width: 100%;
+      color: white;
+      background: rgba(255,255,255,.09);
+      border: 1px solid rgba(255,255,255,.12);
+      outline: none;
+    }
+    textarea { height: 58px; resize: vertical; font-size: 11px; line-height: 1.25; }
+    .mini { opacity: .75; font-size: 12px; line-height: 1.35; }
+    .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .stat {
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.1);
+      padding: 10px;
+      border-radius: 14px;
+    }
+    .stat strong { color: #ffe95c; }
+    .pad {
+      display: none;
+      grid-template-columns: repeat(3, 54px);
+      grid-template-rows: repeat(3, 46px);
+      gap: 6px;
+      justify-content: center;
+    }
+    .pad button {
+      padding: 0;
+      background: rgba(255,255,255,.13);
+      color: white;
+      border: 1px solid rgba(255,255,255,.16);
+    }
+    .hide { visibility: hidden; }
+    code { color: #7ee7ff; }
+    @media (max-width: 800px) {
+      body { padding: 10px; }
+      .app { grid-template-columns: 1fr; }
+      .pad { display: grid; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <canvas id="game" width="560" height="620"></canvas>
+
+    <aside class="panel">
+      <h1>Pac-Man WebRTC Multiplayer</h1>
+      <div class="mini">
+        Host controls Pac-Man. Guest controls the red ghost. Uses a tiny Node.js WebSocket server only for signaling. Actual game data goes through WebRTC DataChannel.
+      </div>
+
+      <div class="stats">
+        <div class="stat">Role<br><strong id="roleText">Solo</strong></div>
+        <div class="stat">Signal<br><strong id="signalText">Offline</strong></div>
+        <div class="stat">RTC<br><strong id="rtcText">Offline</strong></div>
+        <div class="stat">Score<br><strong id="scoreText">0</strong></div>
+        <div class="stat">Lives<br><strong id="livesText">3</strong></div>
+        <div class="stat">Room<br><strong id="roomText">none</strong></div>
+      </div>
+
+      <input id="roomInput" placeholder="room code, ex: B7wtPru" />
+      <div class="row">
+        <button id="hostBtn">Host</button>
+        <button id="joinBtn" class="alt">Join</button>
+        <button id="copyHostBtn">Copy Host URL</button>
+        <button id="copyJoinBtn">Copy Join URL</button>
+      </div>
+      <button id="restartBtn">Restart Game</button>
+
+      <div class="mini">
+        URL examples:<br>
+        <code>?host=B7wtPru</code><br>
+        <code>?join=B7wtPru</code>
+      </div>
+
+      <div class="mini">Controls: Arrow keys or WASD. Space pauses the host.</div>
+
+      <div class="pad">
+        <button class="hide"></button><button data-dir="up">▲</button><button class="hide"></button>
+        <button data-dir="left">◀</button><button data-dir="down">▼</button><button data-dir="right">▶</button>
+      </div>
+
+      <hr style="width:100%; border-color:rgba(255,255,255,.12)">
+      <div class="mini"><strong>Debug</strong></div>
+      <textarea id="logBox" readonly></textarea>
+      <button id="resetRtcBtn" class="danger">Reset Connection</button>
+    </aside>
+  </main>
+
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const roleText = document.getElementById('roleText');
+    const signalText = document.getElementById('signalText');
+    const rtcText = document.getElementById('rtcText');
+    const scoreText = document.getElementById('scoreText');
+    const livesText = document.getElementById('livesText');
+    const roomText = document.getElementById('roomText');
+    const roomInput = document.getElementById('roomInput');
+    const logBox = document.getElementById('logBox');
+
+    const TILE = 20, COLS = 28, ROWS = 31;
+    const rawMap = [
+      '############################',
+      '#............##............#',
+      '#.####.#####.##.#####.####.#',
+      '#o####.#####.##.#####.####o#',
+      '#.####.#####.##.#####.####.#',
+      '#..........................#',
+      '#.####.##.########.##.####.#',
+      '#.####.##.########.##.####.#',
+      '#......##....##....##......#',
+      '######.##### ## #####.######',
+      '######.##### ## #####.######',
+      '######.##          ##.######',
+      '######.## ###--### ##.######',
+      '      .   #      #   .      ',
+      '######.## #      # ##.######',
+      '######.## ######## ##.######',
+      '######.##          ##.######',
+      '######.## ######## ##.######',
+      '######.## ######## ##.######',
+      '#............##............#',
+      '#.####.#####.##.#####.####.#',
+      '#.####.#####.##.#####.####.#',
+      '#o..##................##..o#',
+      '###.##.##.########.##.##.###',
+      '###.##.##.########.##.##.###',
+      '#......##....##....##......#',
+      '#.##########.##.##########.#',
+      '#.##########.##.##########.#',
+      '#..........................#',
+      '############################',
+      '############################'
+    ];
+
+    let map, pellets, score, lives, frightenedTimer, gameOver, win;
+    let role = 'solo', paused = false;
+    let localInput = { x: 0, y: 0 }, remoteInput = { x: 0, y: 0 };
+    let lastTime = 0, stateTick = 0;
+
+    const pac = { x: 14*TILE, y: 23*TILE, dir:{x:0,y:0}, want:{x:0,y:0}, speed: 112, mouth: 0 };
+    const ghosts = [
+      { x:14*TILE, y:11*TILE, dir:{x:1,y:0}, color:'#ff304c', speed:92, homeX:14*TILE, homeY:11*TILE },
+      { x:13*TILE, y:14*TILE, dir:{x:-1,y:0}, color:'#ff9ee8', speed:84, homeX:13*TILE, homeY:14*TILE },
+      { x:14*TILE, y:14*TILE, dir:{x:1,y:0}, color:'#62e5ff', speed:82, homeX:14*TILE, homeY:14*TILE },
+      { x:15*TILE, y:14*TILE, dir:{x:0,y:-1}, color:'#ffb347', speed:80, homeX:15*TILE, homeY:14*TILE }
+    ];
+
+    function log(msg) {
+      logBox.value = String(msg) + '
+' + logBox.value.slice(0, 900);
+    }
+
+    function resetGame() {
+      map = rawMap.map(r => r.split(''));
+      pellets = 0;
+      for (let y=0; y<ROWS; y++) for (let x=0; x<COLS; x++) if (map[y][x] === '.' || map[y][x] === 'o') pellets++;
+      score = 0; lives = 3; frightenedTimer = 0; gameOver = false; win = false;
+      resetPositions(); sendState(true); updateHud();
+    }
+
+    function resetPositions() {
+      pac.x = 14*TILE; pac.y = 23*TILE; pac.dir = {x:0,y:0}; pac.want = {x:0,y:0};
+      ghosts.forEach(g => { g.x = g.homeX; g.y = g.homeY; });
+    }
+
+    function isWallTile(tx, ty) {
+      if (ty < 0 || ty >= ROWS) return true;
+      if (tx < 0 || tx >= COLS) return false;
+      const v = map[ty][tx];
+      return v === '#' || v === '-';
+    }
+
+    function canMoveTo(x, y) {
+      const r = 7;
+      return [[x-r,y-r],[x+r,y-r],[x-r,y+r],[x+r,y+r]].every(([px,py]) => !isWallTile(Math.floor(px/TILE), Math.floor(py/TILE)));
+    }
+
+    function centered(ent) { return Math.abs(ent.x % TILE) < 2 && Math.abs(ent.y % TILE) < 2; }
+    function snap(ent) { ent.x = Math.round(ent.x / TILE) * TILE; ent.y = Math.round(ent.y / TILE) * TILE; }
+
+    function tryTurn(ent, want) {
+      if (!want.x && !want.y) return;
+      if (centered(ent)) {
+        snap(ent);
+        if (canMoveTo(ent.x + want.x * TILE * .55, ent.y + want.y * TILE * .55)) ent.dir = { ...want };
+      }
+    }
+
+    function moveEntity(ent, dt) {
+      let nx = ent.x + ent.dir.x * ent.speed * dt;
+      let ny = ent.y + ent.dir.y * ent.speed * dt;
+      if (nx < -TILE/2) nx = COLS*TILE - TILE/2;
+      if (nx > COLS*TILE - TILE/2) nx = -TILE/2;
+      if (canMoveTo(nx, ny)) { ent.x = nx; ent.y = ny; }
+      else { snap(ent); ent.dir = {x:0,y:0}; }
+    }
+
+    function updatePac(dt) {
+      pac.want = role === 'guest' ? {x:0,y:0} : localInput;
+      tryTurn(pac, pac.want); moveEntity(pac, dt); pac.mouth += dt * 10;
+      const tx = Math.round(pac.x / TILE), ty = Math.round(pac.y / TILE);
+      const cell = map[ty] && map[ty][tx];
+      if (cell === '.' || cell === 'o') {
+        map[ty][tx] = ' '; pellets--; score += cell === 'o' ? 50 : 10;
+        if (cell === 'o') frightenedTimer = 7;
+        if (pellets <= 0) win = true;
+        updateHud();
+      }
+    }
+
+    function ghostOptions(g) {
+      const dirs = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+      return dirs.filter(d => !(d.x === -g.dir.x && d.y === -g.dir.y) && canMoveTo(g.x+d.x*TILE*.8, g.y+d.y*TILE*.8));
+    }
+
+    function chooseAIDir(g) {
+      if (!centered(g)) return;
+      snap(g);
+      let opts = ghostOptions(g);
+      if (!opts.length) opts = [{x:-g.dir.x, y:-g.dir.y}];
+      const flee = frightenedTimer > 0;
+      let best = opts[0], bestScore = flee ? -Infinity : Infinity;
+      for (const d of opts) {
+        const dist = Math.hypot(pac.x-(g.x+d.x*TILE), pac.y-(g.y+d.y*TILE)) + Math.random()*35;
+        if ((!flee && dist < bestScore) || (flee && dist > bestScore)) { bestScore = dist; best = d; }
+      }
+      g.dir = best;
+    }
+
+    function updateGhosts(dt) {
+      ghosts.forEach((g, i) => {
+        g.speed = frightenedTimer > 0 ? 68 : (i === 0 ? 94 : 82);
+        if (i === 0 && role === 'guest') tryTurn(g, localInput);
+        else if (i === 0 && role === 'host') tryTurn(g, remoteInput);
+        else chooseAIDir(g);
+        moveEntity(g, dt);
+      });
+    }
+
+    function collisions() {
+      ghosts.forEach(g => {
+        if (Math.hypot(pac.x - g.x, pac.y - g.y) < 14) {
+          if (frightenedTimer > 0) { score += 200; g.x = g.homeX; g.y = g.homeY; updateHud(); }
+          else { lives--; updateHud(); if (lives <= 0) gameOver = true; resetPositions(); }
+        }
+      });
+    }
+
+    function update(dt) {
+      if (paused || gameOver || win) return;
+      if (role !== 'guest') {
+        frightenedTimer = Math.max(0, frightenedTimer - dt);
+        updatePac(dt); updateGhosts(dt); collisions(); sendState(false);
+      }
+    }
+
+    function drawMap() {
+      ctx.fillStyle = '#000'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.lineWidth = 3; ctx.strokeStyle = '#1f4dff';
+      for (let y=0; y<ROWS; y++) for (let x=0; x<COLS; x++) {
+        const v = map[y][x], px = x*TILE, py = y*TILE;
+        if (v === '#') { ctx.fillStyle = '#071064'; ctx.fillRect(px+1,py+1,TILE-2,TILE-2); ctx.strokeRect(px+2,py+2,TILE-4,TILE-4); }
+        else if (v === '.') { ctx.fillStyle = '#ffe8b2'; ctx.beginPath(); ctx.arc(px+TILE/2,py+TILE/2,2.2,0,Math.PI*2); ctx.fill(); }
+        else if (v === 'o') { ctx.fillStyle = '#ffe8b2'; ctx.beginPath(); ctx.arc(px+TILE/2,py+TILE/2,5.2,0,Math.PI*2); ctx.fill(); }
+        else if (v === '-') { ctx.fillStyle = '#ffb3de'; ctx.fillRect(px+3,py+8,TILE-6,4); }
+      }
+    }
+
+    function drawPac() {
+      const angleBase = Math.atan2(pac.dir.y, pac.dir.x || 0.0001);
+      const moving = pac.dir.x || pac.dir.y;
+      const mouth = moving ? (Math.sin(pac.mouth) * 0.18 + 0.28) : 0.12;
+      ctx.fillStyle = '#ffe95c'; ctx.beginPath(); ctx.moveTo(pac.x,pac.y);
+      ctx.arc(pac.x,pac.y,8.5,angleBase+mouth,angleBase+Math.PI*2-mouth); ctx.closePath(); ctx.fill();
+    }
+
+    function drawGhost(g, i) {
+      ctx.fillStyle = frightenedTimer > 0 ? '#315dff' : g.color;
+      ctx.beginPath(); ctx.arc(g.x,g.y-2,8,Math.PI,0); ctx.lineTo(g.x+8,g.y+8); ctx.lineTo(g.x+4,g.y+5); ctx.lineTo(g.x,g.y+8); ctx.lineTo(g.x-4,g.y+5); ctx.lineTo(g.x-8,g.y+8); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'white'; ctx.beginPath(); ctx.arc(g.x-3.5,g.y-3,2.3,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(g.x+3.5,g.y-3,2.3,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(g.x-3.5+g.dir.x,g.y-3+g.dir.y,1.1,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(g.x+3.5+g.dir.x,g.y-3+g.dir.y,1.1,0,Math.PI*2); ctx.fill();
+      if (i === 0) { ctx.fillStyle = 'white'; ctx.font = '8px Arial'; ctx.textAlign = 'center'; ctx.fillText('P2', g.x, g.y-13); }
+    }
+
+    function drawOverlay() {
+      let text = paused ? 'PAUSED' : gameOver ? 'GAME OVER' : win ? 'YOU WIN' : '';
+      if (!text) return;
+      ctx.fillStyle = 'rgba(0,0,0,.62)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = '#ffe95c'; ctx.font = 'bold 34px Arial'; ctx.textAlign = 'center'; ctx.fillText(text, canvas.width/2, canvas.height/2);
+    }
+
+    function draw() { drawMap(); drawPac(); ghosts.forEach(drawGhost); drawOverlay(); }
+    function loop(t) { const dt = Math.min(0.033, (t-lastTime)/1000 || 0); lastTime = t; update(dt); draw(); requestAnimationFrame(loop); }
+
+    function updateHud() {
+      scoreText.textContent = score;
+      livesText.textContent = lives;
+      roleText.textContent = role[0].toUpperCase() + role.slice(1);
+      signalText.textContent = ws && ws.readyState === WebSocket.OPEN ? 'Online' : 'Offline';
+      rtcText.textContent = channel && channel.readyState === 'open' ? 'Connected' : 'Offline';
+      roomText.textContent = room || 'none';
+    }
+
+    function setInput(dir) {
+      const dirs = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+      localInput = dirs[dir] || localInput; sendInput();
+    }
+    window.addEventListener('keydown', e => {
+      const k = e.key.toLowerCase();
+      if (['arrowup','w'].includes(k)) setInput('up');
+      if (['arrowdown','s'].includes(k)) setInput('down');
+      if (['arrowleft','a'].includes(k)) setInput('left');
+      if (['arrowright','d'].includes(k)) setInput('right');
+      if (k === ' ' && role !== 'guest') paused = !paused;
+    });
+    document.querySelectorAll('[data-dir]').forEach(btn => btn.addEventListener('pointerdown', () => setInput(btn.dataset.dir)));
+    document.getElementById('restartBtn').onclick = () => { if (role !== 'guest') { resetGame(); send({ type:'restart' }); } };
+
+    // ---------- WebSocket signaling + WebRTC ----------
+    let ws = null, pc = null, channel = null, room = '';
+    const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+    function wsUrl() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return proto + '//' + location.host;
+    }
+
+    function makeRoom() {
+      return Math.random().toString(36).slice(2, 9);
+    }
+
+    function connectSignal(next) {
+      if (ws && ws.readyState === WebSocket.OPEN) return next();
+      ws = new WebSocket(wsUrl());
+      ws.onopen = () => { log('Signal connected'); updateHud(); next(); };
+      ws.onclose = () => { log('Signal closed'); updateHud(); };
+      ws.onerror = () => { log('Signal error'); updateHud(); };
+      ws.onmessage = async e => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'peer-joined' && role === 'host') {
+          log('Guest joined, creating offer');
+          await createAndSendOffer();
+        }
+        if (msg.type === 'offer' && role === 'guest') {
+          log('Offer received');
+          await receiveOffer(msg.sdp);
+        }
+        if (msg.type === 'answer' && role === 'host') {
+          log('Answer received');
+          await pc.setRemoteDescription(msg.sdp);
+        }
+        if (msg.type === 'ice' && pc && msg.candidate) {
+          try { await pc.addIceCandidate(msg.candidate); }
+          catch (err) { log('ICE add failed: ' + err.message); }
+        }
+        if (msg.type === 'full') log('Room is full');
+        if (msg.type === 'joined') log('Joined room ' + msg.room + ' as ' + msg.role);
+      };
+    }
+
+    function signal(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ room, ...obj }));
+    }
+
+    function setupPeer(asHost) {
+      if (pc) pc.close();
+      pc = new RTCPeerConnection(rtcConfig);
+      role = asHost ? 'host' : 'guest';
+      updateHud();
+
+      pc.onicecandidate = e => {
+        if (e.candidate) signal({ type:'ice', candidate: e.candidate });
+      };
+      pc.onconnectionstatechange = () => { log('RTC: ' + pc.connectionState); updateHud(); };
+
+      if (asHost) {
+        channel = pc.createDataChannel('game');
+        setupChannel();
+      } else {
+        pc.ondatachannel = e => { channel = e.channel; setupChannel(); };
+      }
+    }
+
+    function setupChannel() {
+      channel.onopen = () => { log('DataChannel open'); updateHud(); sendState(true); };
+      channel.onclose = () => { log('DataChannel closed'); updateHud(); };
+      channel.onmessage = e => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'input') remoteInput = msg.input;
+        if (msg.type === 'state' && role === 'guest') applyState(msg.state);
+        if (msg.type === 'restart' && role === 'guest') resetGame();
+      };
+    }
+
+    async function createAndSendOffer() {
+      if (!pc) setupPeer(true);
+      await pc.setLocalDescription(await pc.createOffer());
+      signal({ type:'offer', sdp: pc.localDescription });
+    }
+
+    async function receiveOffer(sdp) {
+      if (!pc) setupPeer(false);
+      await pc.setRemoteDescription(sdp);
+      await pc.setLocalDescription(await pc.createAnswer());
+      signal({ type:'answer', sdp: pc.localDescription });
+    }
+
+    function startHost(code) {
+      room = code || roomInput.value.trim() || makeRoom();
+      roomInput.value = room;
+      setupPeer(true);
+      connectSignal(() => signal({ type:'join', role:'host' }));
+      updateUrl('host', room);
+      updateHud();
+    }
+
+    function startJoin(code) {
+      room = code || roomInput.value.trim() || makeRoom();
+      roomInput.value = room;
+      setupPeer(false);
+      connectSignal(() => signal({ type:'join', role:'guest' }));
+      updateUrl('join', room);
+      updateHud();
+    }
+
+    function updateUrl(mode, code) {
+      const url = new URL(location.href);
+      url.search = '?' + mode + '=' + encodeURIComponent(code);
+      history.replaceState(null, '', url.toString());
+    }
+
+    function buildUrl(mode) {
+      const code = roomInput.value.trim() || room || makeRoom();
+      const url = new URL(location.href);
+      url.search = '?' + mode + '=' + encodeURIComponent(code);
+      return url.toString();
+    }
+
+    function send(obj) {
+      if (channel && channel.readyState === 'open') channel.send(JSON.stringify(obj));
+    }
+    function sendInput() { send({ type:'input', input: localInput }); }
+    function packState() {
+      return {
+        map: map.map(r => r.join('')), pellets, score, lives, frightenedTimer, gameOver, win, paused,
+        pac: {x:pac.x,y:pac.y,dir:pac.dir,mouth:pac.mouth},
+        ghosts: ghosts.map(g => ({x:g.x,y:g.y,dir:g.dir}))
+      };
+    }
+    function applyState(s) {
+      map = s.map.map(r => r.split('')); pellets = s.pellets; score = s.score; lives = s.lives; frightenedTimer = s.frightenedTimer; gameOver = s.gameOver; win = s.win; paused = s.paused;
+      pac.x = s.pac.x; pac.y = s.pac.y; pac.dir = s.pac.dir; pac.mouth = s.pac.mouth;
+      s.ghosts.forEach((sg,i) => { ghosts[i].x = sg.x; ghosts[i].y = sg.y; ghosts[i].dir = sg.dir; }); updateHud();
+    }
+    function sendState(force) { if (role !== 'host') return; stateTick++; if (force || stateTick % 2 === 0) send({ type:'state', state: packState() }); }
+
+    document.getElementById('hostBtn').onclick = () => startHost();
+    document.getElementById('joinBtn').onclick = () => startJoin();
+    document.getElementById('copyHostBtn').onclick = async () => {
+      const url = buildUrl('host'); roomInput.value = new URL(url).searchParams.get('host'); await navigator.clipboard.writeText(url); log('Copied host URL');
+    };
+    document.getElementById('copyJoinBtn').onclick = async () => {
+      const code = roomInput.value.trim() || room || makeRoom(); roomInput.value = code;
+      const url = new URL(location.href); url.search = '?join=' + encodeURIComponent(code); await navigator.clipboard.writeText(url.toString()); log('Copied join URL');
+    };
+    document.getElementById('resetRtcBtn').onclick = () => {
+      if (channel) channel.close(); if (pc) pc.close(); if (ws) ws.close();
+      ws = pc = channel = null; role = 'solo'; updateHud(); log('Connection reset');
+    };
+
+    const params = new URLSearchParams(location.search);
+    resetGame();
+    if (params.get('host')) startHost(params.get('host'));
+    else if (params.get('join')) startJoin(params.get('join'));
+    else roomInput.value = makeRoom();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
