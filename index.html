@@ -130,6 +130,39 @@
   <script>
     const canvas = document.getElementById('game');
     const ctx = canvas.getContext('2d');
+
+    function showCanvasError(err) {
+      const message = err && err.message ? err.message : String(err);
+      ctx.fillStyle = '#050510';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#ff7e99';
+      ctx.font = 'bold 18px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('JavaScript error', canvas.width / 2, 250);
+      ctx.fillStyle = 'white';
+      ctx.font = '13px Arial';
+      wrapText(message, canvas.width / 2, 285, 500, 18);
+      console.error(err);
+    }
+
+    function wrapText(text, x, y, maxWidth, lineHeight) {
+      const words = String(text).split(' ');
+      let line = '';
+      for (let n = 0; n < words.length; n++) {
+        const testLine = line + words[n] + ' ';
+        if (ctx.measureText(testLine).width > maxWidth && n > 0) {
+          ctx.fillText(line, x, y);
+          line = words[n] + ' ';
+          y += lineHeight;
+        } else {
+          line = testLine;
+        }
+      }
+      ctx.fillText(line, x, y);
+    }
+
+    window.addEventListener('error', e => showCanvasError(e.error || e.message));
+    window.addEventListener('unhandledrejection', e => showCanvasError(e.reason || e));
     const roleText = document.getElementById('roleText');
     const signalText = document.getElementById('signalText');
     const rtcText = document.getElementById('rtcText');
@@ -332,7 +365,17 @@
     }
 
     function draw() { drawMap(); drawPac(); ghosts.forEach(drawGhost); drawOverlay(); }
-    function loop(t) { const dt = Math.min(0.033, (t-lastTime)/1000 || 0); lastTime = t; update(dt); draw(); requestAnimationFrame(loop); }
+    function loop(t) {
+      try {
+        const dt = Math.min(0.033, (t - lastTime) / 1000 || 0);
+        lastTime = t;
+        update(dt);
+        draw();
+        requestAnimationFrame(loop);
+      } catch (err) {
+        showCanvasError(err);
+      }
+    }
 
     function updateHud() {
       scoreText.textContent = score;
@@ -511,11 +554,16 @@
     };
 
     const params = new URLSearchParams(location.search);
-    resetGame();
-    if (params.get('host')) startHost(params.get('host'));
-    else if (params.get('join')) startJoin(params.get('join'));
-    else roomInput.value = makeRoom();
-    requestAnimationFrame(loop);
+    try {
+      resetGame();
+      draw();
+      if (params.get('host')) startHost(params.get('host'));
+      else if (params.get('join')) startJoin(params.get('join'));
+      else roomInput.value = makeRoom();
+      requestAnimationFrame(loop);
+    } catch (err) {
+      showCanvasError(err);
+    }
   </script>
 </body>
 </html>
